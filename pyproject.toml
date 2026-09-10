@@ -1,0 +1,38 @@
+[project]
+name = "hardcopy"
+version = "0.1.0"
+description = "Take a photograph of a printed page and put it on paper"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Kevin Ghadyani" }]
+requires-python = ">=3.11"
+dependencies = [
+    "opencv-python-headless>=4.9",
+    "numpy>=1.26",
+    "pillow>=10",
+]
+
+[project.optional-dependencies]
+# ruff is PINNED, not floated. CI runs `pip install -e ".[dev]"` then `ruff check .`,
+# so a new ruff release adds rules and turns main red with no code change here. Bump
+# this deliberately, with the fixes in the same pull request.
+dev = ["pytest>=8", "ruff==0.16.3"]
+
+[project.urls]
+Homepage = "https://github.com/Sawtaytoes/hardcopy"
+
+[project.scripts]
+hardcopy = "hardcopy.__main__:run"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["hardcopy"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100

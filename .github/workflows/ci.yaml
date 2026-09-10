@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  # The docs-only detector is SHARED: the body lives in Charcuterie and is
+  # imported, not copied. Fix it there, then move the `workflows-v1` tag.
+  #
+  # WARNING: imported from GitHub. A reusable workflow resolves on THIS host
+  # only. A cross-host import is dropped SILENTLY -- the run still reports
+  # success -- so the gates below would never run. Consumers must also keep
+  # turning their gates off with `if:` rather than `paths-ignore:`, or a
+  # required check stays pending forever.
+  changes:
+    uses: Sawtaytoes/charcuterie/.github/workflows/shared-docs-only-changes.yml@workflows-v1
+
+  # The one gate a docs-only change DOES run. It lints the decision records
+  # the pull request TOUCHED, never the whole tree.
+  docs:
+    uses: Sawtaytoes/charcuterie/.github/workflows/shared-docs-lint.yml@workflows-v1
+
+  test:
+    needs: [changes]
+    # Skipped, not absent: this still posts its status context.
+    if: ${{ needs.changes.outputs.isDocsOnly != 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: pip install -e ".[dev]"
+      - name: Lint
+        run: ruff check .
+      - name: Test
+        run: pytest -q
