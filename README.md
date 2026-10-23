@@ -1,4 +1,4 @@
-# hardcopy
+# Hardcopy
 
 Take a photograph of a printed page and put it on paper.
 
