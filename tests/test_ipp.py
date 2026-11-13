@@ -303,6 +303,41 @@ def test_request_survives_many_interim_replies(monkeypatch):
     assert ipp.request("printer.invalid", ipp.OP_GET_JOBS)[1] == {"job-id": [283]}
 
 
+def test_parse_rejects_an_answer_with_no_end_of_attributes_tag():
+    """A reply cut at an attribute boundary must not read as a complete, healthy one."""
+    state = ipp.attribute(ipp.ENUM, b"printer-state", struct.pack(">i", ipp.PRINTER_STATE_IDLE))
+    whole = response(0x0000, state)
+    with pytest.raises(ipp.IppError, match="end-of-attributes"):
+        ipp.parse(whole[:-1])
+    with pytest.raises(ipp.IppError, match="end-of-attributes"):
+        ipp.parse_body(ipp_body()[:8])
+
+
+def test_request_cut_short_cannot_confirm_a_print(monkeypatch):
+    state = ipp.attribute(ipp.ENUM, b"printer-state", struct.pack(">i", ipp.PRINTER_STATE_IDLE))
+    connect_to(monkeypatch, [response(0x0000, state)[:-1], b""])
+    with pytest.raises(ipp.IppError, match="end-of-attributes"):
+        ipp.printer_state("printer.invalid", user="tester")
+
+
+def test_request_has_a_deadline_for_the_whole_answer(monkeypatch):
+    """A printer that trickles interim replies forever must not hold the request open."""
+    clock = iter(range(0, 10_000, 10))
+    monkeypatch.setattr(ipp.time, "monotonic", lambda: next(clock))
+    fake = connect_to(monkeypatch, [b"HTTP/1.1 100 Continue\r\n\r\n"] * 1000)
+    with pytest.raises(ipp.IppError, match="did not finish answering"):
+        ipp.request("printer.invalid", ipp.OP_GET_JOBS, timeout=60)
+    assert fake.is_closed
+    assert len(fake.replies) > 900
+
+
+def test_request_refuses_an_endless_answer(monkeypatch):
+    fake = connect_to(monkeypatch, [b"HTTP/1.1 200 OK\r\n\r\n"] + [b"x" * 65536] * 300)
+    with pytest.raises(ipp.IppError, match="larger than"):
+        ipp.request("printer.invalid", ipp.OP_GET_JOBS)
+    assert fake.is_closed
+
+
 def test_request_reports_an_unreachable_printer_as_ipp_error(monkeypatch):
     def refuse(*_a, **_k):
         raise ConnectionRefusedError("refused")

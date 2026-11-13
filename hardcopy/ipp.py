@@ -43,6 +43,10 @@ PRINTER_STATE_STOPPED = 5
 # An IPP status code below 0x0100 is a success class.
 STATUS_OK_MAX = 0x0100
 
+# A printer's answer to these operations is a few kilobytes. Anything this large is not
+# an IPP reply, and reading it would only grow memory.
+MAX_REPLY_BYTES = 16 * 1024 * 1024
+
 # ASCII digits only, with a length cap. ``str.isdigit`` accepts characters such as
 # a superscript two that ``int`` rejects, and a very long field would pass the check
 # and then fail inside ``int``.
@@ -93,9 +97,10 @@ def request(host: str, operation: int, *, port: int = 631, resource: str = "/ipp
     except OSError as error:
         raise IppError(f"cannot reach the printer at {host}:{port}: {error}") from error
     try:
+        deadline = time.monotonic() + timeout
         sock.settimeout(timeout)
         sock.sendall(header + payload)
-        body = _receive(sock)
+        body = _receive(sock, deadline)
     except TimeoutError as error:
         # A timeout is not the end of the answer. Parsing what arrived so far would read
         # a cut-off reply as a complete one.
@@ -107,19 +112,26 @@ def request(host: str, operation: int, *, port: int = 631, resource: str = "/ipp
     return parse_body(body)
 
 
-def _receive(sock: socket.socket) -> bytes:
+def _receive(sock: socket.socket, deadline: float) -> bytes:
     """Read one HTTP reply and return its IPP body.
 
     Reading stops as soon as the HTTP framing says the reply is complete, so a printer
     that keeps the connection open despite ``Connection: close`` does not hold us until
-    the timeout.
+    the timeout. ``deadline`` bounds the whole reply, not each read, so a printer that
+    keeps sending a few bytes at a time cannot hold the request open forever.
     """
     raw = b""
     while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("reply deadline passed")
+        sock.settimeout(remaining)
         chunk = sock.recv(65536)
         if not chunk:
             return http_body(raw, is_closed=True)
         raw += chunk
+        if len(raw) > MAX_REPLY_BYTES:
+            raise IppError(f"printer's answer is larger than {MAX_REPLY_BYTES} bytes")
         body = http_body(raw, is_closed=False)
         if body is not None:
             return body
@@ -224,11 +236,13 @@ def parse_body(body: bytes) -> tuple[int, dict]:
 
     status = struct.unpack(">H", body[2:4])[0]
     position, current, out = 8, None, {}
+    is_ended = False
     while position < len(body):
         tag = body[position]
         position += 1
         if tag in (1, 2, 3, 4, 5):
             if tag == 3:  # end-of-attributes
+                is_ended = True
                 break
             continue
         name_length = struct.unpack(">H", _take(body, position, 2))[0]
@@ -244,6 +258,10 @@ def parse_body(body: bytes) -> tuple[int, dict]:
         elif current is None:
             raise IppError("IPP answer starts a value with no attribute name")
         out.setdefault(current, []).append(_value(tag, value))
+    if not is_ended:
+        # Without the end tag the reply was cut short, and a missing attribute such as
+        # a later printer-state-reasons value could hide a jam.
+        raise IppError("IPP answer has no end-of-attributes tag")
     return status, out
 
 
