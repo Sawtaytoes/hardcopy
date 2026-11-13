@@ -16,6 +16,7 @@ Two things about real printers shape this code:
 
 from __future__ import annotations
 
+import re
 import socket
 import struct
 import time
@@ -41,6 +42,13 @@ PRINTER_STATE_STOPPED = 5
 
 # An IPP status code below 0x0100 is a success class.
 STATUS_OK_MAX = 0x0100
+
+# ASCII digits only, with a length cap. ``str.isdigit`` accepts characters such as
+# a superscript two that ``int`` rejects, and a very long field would pass the check
+# and then fail inside ``int``.
+_HTTP_STATUS = re.compile(r"[0-9]{3}")
+_CONTENT_LENGTH = re.compile(r"[0-9]{1,15}")
+_CHUNK_SIZE = re.compile(rb"[0-9A-Fa-f]{1,15}")
 
 
 class IppError(RuntimeError):
@@ -125,21 +133,25 @@ def http_body(raw: bytes, *, is_closed: bool) -> bytes | None:
     Handles ``Transfer-Encoding: chunked``, ``Content-Length``, and a body that runs to
     the end of the connection, and skips interim ``1xx`` replies.
     """
-    split = raw.find(b"\r\n\r\n")
-    if split < 0:
-        if is_closed:
-            raise IppError("no HTTP header terminator in the printer's answer")
-        return None
-    lines = raw[:split].decode("latin-1").split("\r\n")
-    rest = raw[split + 4 :]
+    # A loop, not recursion: a printer that sends many interim replies must not
+    # exhaust the stack.
+    while True:
+        split = raw.find(b"\r\n\r\n")
+        if split < 0:
+            if is_closed:
+                raise IppError("no HTTP header terminator in the printer's answer")
+            return None
+        lines = raw[:split].decode("latin-1").split("\r\n")
+        raw = raw[split + 4 :]
 
-    status_line = lines[0].split(" ", 2)
-    if (len(status_line) < 2 or not status_line[0].startswith("HTTP/")
-            or not status_line[1].isdigit()):
-        raise IppError(f"the printer's answer is not HTTP: {lines[0]!r}")
-    code = int(status_line[1])
-    if 100 <= code < 200:
-        return http_body(rest, is_closed=is_closed)
+        status_line = lines[0].split(" ", 2)
+        if (len(status_line) < 2 or not status_line[0].startswith("HTTP/")
+                or not _HTTP_STATUS.fullmatch(status_line[1])):
+            raise IppError(f"the printer's answer is not HTTP: {lines[0]!r}")
+        code = int(status_line[1])
+        if not 100 <= code < 200:
+            break
+    rest = raw
     if code != 200:
         raise IppError(f"printer answered HTTP {code}")
 
@@ -152,7 +164,7 @@ def http_body(raw: bytes, *, is_closed: bool) -> bytes | None:
         return _dechunk(rest, is_closed=is_closed)
     if "content-length" in headers:
         length_field = headers["content-length"]
-        if not length_field.isdigit():
+        if not _CONTENT_LENGTH.fullmatch(length_field):
             raise IppError(f"bad Content-Length in the printer's answer: {length_field!r}")
         length = int(length_field)
         if len(rest) >= length:
@@ -173,7 +185,7 @@ def _dechunk(data: bytes, *, is_closed: bool) -> bytes | None:
         if line_end < 0:
             break
         size_field = data[position:line_end].split(b";", 1)[0].strip()
-        if not size_field or any(c not in b"0123456789abcdefABCDEF" for c in size_field):
+        if not _CHUNK_SIZE.fullmatch(size_field):
             raise IppError(f"bad chunk size in the printer's answer: {size_field!r}")
         size = int(size_field, 16)
         start = line_end + 2

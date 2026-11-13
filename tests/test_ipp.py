@@ -281,6 +281,28 @@ def test_request_reads_a_close_delimited_answer(monkeypatch):
     assert ipp.request("printer.invalid", ipp.OP_GET_JOBS)[1] == {"job-id": [283]}
 
 
+@pytest.mark.parametrize("raw", [
+    "HTTP/1.1 200 OK\r\nContent-Length: \u00b2\r\n\r\n".encode("latin-1"),
+    b"HTTP/1.1 200 OK\r\nContent-Length: " + b"9" * 4301 + b"\r\n\r\n",
+    b"HTTP/1.1 200 OK\r\nContent-Length: -5\r\n\r\n",
+    "HTTP/1.1 2\u00b20 OK\r\n\r\n".encode("latin-1"),
+    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n" + b"f" * 40 + b"\r\n",
+])
+def test_request_reports_a_malformed_number_as_ipp_error(monkeypatch, raw):
+    """``str.isdigit`` passes a superscript two, and ``int`` rejects it with ValueError."""
+    fake = connect_to(monkeypatch, [raw, b""])
+    with pytest.raises(ipp.IppError):
+        ipp.request("printer.invalid", ipp.OP_GET_JOBS)
+    assert fake.is_closed
+
+
+def test_request_survives_many_interim_replies(monkeypatch):
+    """Each interim reply used to cost a stack frame, so enough of them crashed."""
+    raw = b"HTTP/1.1 100 Continue\r\n\r\n" * 1100 + response(0x0000, JOB_ID)
+    connect_to(monkeypatch, [raw, b""])
+    assert ipp.request("printer.invalid", ipp.OP_GET_JOBS)[1] == {"job-id": [283]}
+
+
 def test_request_reports_an_unreachable_printer_as_ipp_error(monkeypatch):
     def refuse(*_a, **_k):
         raise ConnectionRefusedError("refused")
