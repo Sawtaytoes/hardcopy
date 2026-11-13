@@ -1,7 +1,8 @@
 """The IPP encoder and decoder, with no printer on the network.
 
-Every test here builds the bytes a printer would send. Nothing opens a socket, so the
-suite runs on a CI machine that has never seen a printer.
+Every test here builds the bytes a printer would send. Nothing opens a real socket -- a
+fake one plays the bytes back -- so the suite runs on a CI machine that has never seen a
+printer.
 """
 
 from __future__ import annotations
@@ -117,6 +118,176 @@ def test_wait_until_idle_does_not_pass_while_jobs_remain(monkeypatch):
     with pytest.raises(ipp.IppError, match="did not go idle"):
         ipp.wait_until_idle("printer.invalid", user="tester", timeout=0.2, interval=0.01,
                             sleep=lambda _: None)
+
+
+@pytest.mark.parametrize("reason", ["toner-low-warning", "media-low-report",
+                                    "marker-supply-low-warning"])
+def test_wait_until_idle_passes_a_report_or_a_warning(monkeypatch, reason):
+    """Low toner does not stop a print, so it must not turn a finished print into an error."""
+    monkeypatch.setattr(ipp, "printer_state",
+                        lambda *a, **k: (ipp.PRINTER_STATE_IDLE, [reason]))
+    monkeypatch.setattr(ipp, "pending_jobs", lambda *a, **k: [])
+    state, reasons = ipp.wait_until_idle("printer.invalid", user="tester",
+                                         sleep=lambda _: None)
+    assert state == ipp.PRINTER_STATE_IDLE
+    assert reasons == [reason]
+
+
+@pytest.mark.parametrize("reason", ["toner-empty-error", "media-jam", "door-open"])
+def test_wait_until_idle_blocks_on_an_error_or_an_unsuffixed_reason(monkeypatch, reason):
+    """RFC 8011 says a reason with no suffix is an error, so it blocks like ``-error``."""
+    monkeypatch.setattr(ipp, "printer_state",
+                        lambda *a, **k: (ipp.PRINTER_STATE_STOPPED,
+                                         ["toner-low-warning", reason]))
+    monkeypatch.setattr(ipp, "pending_jobs", lambda *a, **k: [1])
+    with pytest.raises(ipp.IppError, match=reason) as caught:
+        ipp.wait_until_idle("printer.invalid", user="tester", sleep=lambda _: None)
+    assert "toner-low-warning" not in str(caught.value)
+
+
+def ipp_body(status: int = 0x0000, attributes: bytes = b"") -> bytes:
+    return response(status, attributes).split(b"\r\n\r\n", 1)[1]
+
+
+def chunked(body: bytes, size: int = 5) -> bytes:
+    out = b""
+    for start in range(0, len(body), size):
+        piece = body[start : start + size]
+        out += f"{len(piece):x}".encode() + b";ext=1\r\n" + piece + b"\r\n"
+    return out + b"0\r\nX-Trailer: yes\r\n\r\n"
+
+
+JOB_ID = ipp.attribute(ipp.INTEGER, b"job-id", struct.pack(">i", 283))
+CHUNKED_HEADER = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+
+
+def test_parse_decodes_a_chunked_answer():
+    status, answer = ipp.parse(CHUNKED_HEADER + chunked(ipp_body(0x0000, JOB_ID)))
+    assert status == 0x0000
+    assert answer["job-id"] == [283]
+
+
+def test_parse_rejects_a_chunked_answer_cut_off_before_the_last_chunk():
+    whole = chunked(ipp_body(0x0000, JOB_ID))
+    with pytest.raises(ipp.IppError, match="chunked"):
+        ipp.parse(CHUNKED_HEADER + whole[: len(whole) // 2])
+
+
+def test_parse_rejects_a_bad_chunk_size():
+    with pytest.raises(ipp.IppError, match="chunk size"):
+        ipp.parse(CHUNKED_HEADER + b"zz\r\nabc\r\n0\r\n\r\n")
+
+
+def test_parse_reads_only_content_length_bytes():
+    body = ipp_body(0x0000, JOB_ID)
+    raw = b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n" % len(body) + body + b"junk"
+    assert ipp.parse(raw)[1]["job-id"] == [283]
+
+
+def test_parse_rejects_an_answer_shorter_than_its_content_length():
+    body = ipp_body(0x0000, JOB_ID)
+    raw = b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n" % (len(body) + 10) + body
+    with pytest.raises(ipp.IppError, match="closed the connection"):
+        ipp.parse(raw)
+
+
+def test_parse_skips_an_interim_continue():
+    raw = b"HTTP/1.1 100 Continue\r\n\r\n" + response(0x0000, JOB_ID)
+    assert ipp.parse(raw)[1]["job-id"] == [283]
+
+
+def test_parse_rejects_an_http_error():
+    with pytest.raises(ipp.IppError, match="HTTP 401"):
+        ipp.parse(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n")
+
+
+@pytest.mark.parametrize("cut", [1, 2, 3, 6, 10, len(JOB_ID) - 1])
+def test_parse_raises_ipp_error_not_struct_error_on_a_cut_attribute(cut):
+    """A reply cut inside an attribute must surface as IppError, which the CLI reports."""
+    head = b"\x02\x00\x00\x00\x00\x00\x00\x01\x01"
+    with pytest.raises(ipp.IppError):
+        ipp.parse_body(head + JOB_ID[:cut])
+
+
+def test_parse_rejects_an_integer_of_the_wrong_length():
+    attrs = ipp.attribute(ipp.INTEGER, b"job-id", b"\x01\x02")
+    with pytest.raises(ipp.IppError, match="integer"):
+        ipp.parse(response(0x0000, attrs))
+
+
+def test_parse_rejects_an_empty_boolean():
+    attrs = ipp.attribute(ipp.BOOLEAN, b"printer-is-accepting-jobs", b"")
+    with pytest.raises(ipp.IppError, match="boolean"):
+        ipp.parse(response(0x0000, attrs))
+
+
+class FakeSocket:
+    """Plays back a list of ``recv`` results. An exception in the list is raised."""
+
+    def __init__(self, replies):
+        self.replies = list(replies)
+        self.sent = b""
+        self.is_closed = False
+
+    def settimeout(self, _):
+        pass
+
+    def sendall(self, data):
+        self.sent += data
+
+    def recv(self, _):
+        reply = self.replies.pop(0)
+        if isinstance(reply, BaseException):
+            raise reply
+        return reply
+
+    def close(self):
+        self.is_closed = True
+
+
+def connect_to(monkeypatch, replies) -> FakeSocket:
+    fake = FakeSocket(replies)
+    monkeypatch.setattr(ipp.socket, "create_connection", lambda *a, **k: fake)
+    return fake
+
+
+def test_request_treats_a_timeout_as_an_error_not_as_the_end_of_the_answer(monkeypatch):
+    whole = response(0x0000, JOB_ID)
+    fake = connect_to(monkeypatch, [whole[:-4], TimeoutError("timed out")])
+    with pytest.raises(ipp.IppError, match="did not finish answering"):
+        ipp.request("printer.invalid", ipp.OP_GET_JOBS)
+    assert fake.is_closed
+
+
+def test_request_decodes_a_chunked_answer_split_across_reads(monkeypatch):
+    raw = CHUNKED_HEADER + chunked(ipp_body(0x0000, JOB_ID), size=3)
+    reads = [raw[i : i + 7] for i in range(0, len(raw), 7)]
+    # No end-of-stream: the request must stop at the last chunk on its own.
+    connect_to(monkeypatch, reads + [AssertionError("read past the end of the answer")])
+    assert ipp.request("printer.invalid", ipp.OP_GET_JOBS) == (0x0000, {"job-id": [283]})
+
+
+def test_request_stops_at_content_length_when_the_printer_keeps_the_connection(monkeypatch):
+    body = ipp_body(0x0000, JOB_ID)
+    raw = b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n" % len(body) + body
+    connect_to(monkeypatch, [raw[:20], raw[20:],
+                             AssertionError("read past the end of the answer")])
+    assert ipp.request("printer.invalid", ipp.OP_GET_JOBS)[1] == {"job-id": [283]}
+
+
+def test_request_reads_a_close_delimited_answer(monkeypatch):
+    raw = response(0x0000, JOB_ID)
+    connect_to(monkeypatch, [raw[:15], raw[15:], b""])
+    assert ipp.request("printer.invalid", ipp.OP_GET_JOBS)[1] == {"job-id": [283]}
+
+
+def test_request_reports_an_unreachable_printer_as_ipp_error(monkeypatch):
+    def refuse(*_a, **_k):
+        raise ConnectionRefusedError("refused")
+
+    monkeypatch.setattr(ipp.socket, "create_connection", refuse)
+    with pytest.raises(ipp.IppError, match="cannot reach"):
+        ipp.request("printer.invalid", ipp.OP_GET_JOBS)
 
 
 def test_no_printer_address_is_committed_in_this_repository():

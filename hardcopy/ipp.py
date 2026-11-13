@@ -80,30 +80,133 @@ def request(host: str, operation: int, *, port: int = 631, resource: str = "/ipp
         f"Connection: close\r\n\r\n"
     ).encode()
 
-    sock = socket.create_connection((host, port), 30)
+    try:
+        sock = socket.create_connection((host, port), 30)
+    except OSError as error:
+        raise IppError(f"cannot reach the printer at {host}:{port}: {error}") from error
     try:
         sock.settimeout(timeout)
         sock.sendall(header + payload)
-        chunks = []
-        while True:
-            try:
-                chunk = sock.recv(65536)
-            except TimeoutError:
-                break
-            if not chunk:
-                break
-            chunks.append(chunk)
+        body = _receive(sock)
+    except TimeoutError as error:
+        # A timeout is not the end of the answer. Parsing what arrived so far would read
+        # a cut-off reply as a complete one.
+        raise IppError(f"printer did not finish answering within {timeout:.0f}s") from error
+    except OSError as error:
+        raise IppError(f"connection to the printer failed: {error}") from error
     finally:
         sock.close()
-    return parse(b"".join(chunks))
+    return parse_body(body)
+
+
+def _receive(sock: socket.socket) -> bytes:
+    """Read one HTTP reply and return its IPP body.
+
+    Reading stops as soon as the HTTP framing says the reply is complete, so a printer
+    that keeps the connection open despite ``Connection: close`` does not hold us until
+    the timeout.
+    """
+    raw = b""
+    while True:
+        chunk = sock.recv(65536)
+        if not chunk:
+            return http_body(raw, is_closed=True)
+        raw += chunk
+        body = http_body(raw, is_closed=False)
+        if body is not None:
+            return body
+
+
+def http_body(raw: bytes, *, is_closed: bool) -> bytes | None:
+    """Return the IPP body of an HTTP reply, or ``None`` while more bytes are due.
+
+    ``is_closed`` says the printer has closed the connection, so nothing more will
+    arrive and an incomplete reply is an error rather than a reason to keep reading.
+    Handles ``Transfer-Encoding: chunked``, ``Content-Length``, and a body that runs to
+    the end of the connection, and skips interim ``1xx`` replies.
+    """
+    split = raw.find(b"\r\n\r\n")
+    if split < 0:
+        if is_closed:
+            raise IppError("no HTTP header terminator in the printer's answer")
+        return None
+    lines = raw[:split].decode("latin-1").split("\r\n")
+    rest = raw[split + 4 :]
+
+    status_line = lines[0].split(" ", 2)
+    if (len(status_line) < 2 or not status_line[0].startswith("HTTP/")
+            or not status_line[1].isdigit()):
+        raise IppError(f"the printer's answer is not HTTP: {lines[0]!r}")
+    code = int(status_line[1])
+    if 100 <= code < 200:
+        return http_body(rest, is_closed=is_closed)
+    if code != 200:
+        raise IppError(f"printer answered HTTP {code}")
+
+    headers = {}
+    for line in lines[1:]:
+        name, _, value = line.partition(":")
+        headers[name.strip().lower()] = value.strip()
+
+    if "chunked" in headers.get("transfer-encoding", "").lower():
+        return _dechunk(rest, is_closed=is_closed)
+    if "content-length" in headers:
+        length_field = headers["content-length"]
+        if not length_field.isdigit():
+            raise IppError(f"bad Content-Length in the printer's answer: {length_field!r}")
+        length = int(length_field)
+        if len(rest) >= length:
+            return rest[:length]
+        if is_closed:
+            raise IppError(f"printer closed the connection after {len(rest)} of "
+                           f"{length} bytes")
+        return None
+    return rest if is_closed else None
+
+
+def _dechunk(data: bytes, *, is_closed: bool) -> bytes | None:
+    """Decode a chunked HTTP body, or return ``None`` while more bytes are due."""
+    out = bytearray()
+    position = 0
+    while True:
+        line_end = data.find(b"\r\n", position)
+        if line_end < 0:
+            break
+        size_field = data[position:line_end].split(b";", 1)[0].strip()
+        if not size_field or any(c not in b"0123456789abcdefABCDEF" for c in size_field):
+            raise IppError(f"bad chunk size in the printer's answer: {size_field!r}")
+        size = int(size_field, 16)
+        start = line_end + 2
+        if size == 0:
+            # The last chunk. Optional trailer lines follow, then a blank line.
+            if data.find(b"\r\n\r\n", line_end) >= 0:
+                return bytes(out)
+            break
+        end = start + size
+        if len(data) < end + 2:
+            break
+        if data[end : end + 2] != b"\r\n":
+            raise IppError("a chunk in the printer's answer does not end with CRLF")
+        out += data[start:end]
+        position = end + 2
+    if is_closed:
+        raise IppError("printer closed the connection inside a chunked answer")
+    return None
 
 
 def parse(raw: bytes) -> tuple[int, dict]:
-    """Pull the status code and the attribute list out of an IPP response."""
-    split = raw.find(b"\r\n\r\n")
-    if split < 0:
-        raise IppError("no HTTP header terminator in the printer's answer")
-    body = raw[split + 4 :]
+    """Pull the status code and the attribute list out of a complete HTTP reply."""
+    return parse_body(http_body(raw, is_closed=True))
+
+
+def _take(body: bytes, position: int, length: int) -> bytes:
+    if position + length > len(body):
+        raise IppError("IPP answer ends inside an attribute")
+    return body[position : position + length]
+
+
+def parse_body(body: bytes) -> tuple[int, dict]:
+    """Pull the status code and the attribute list out of an IPP message body."""
     if len(body) < 8:
         raise IppError("IPP answer is too short to hold a status code")
 
@@ -116,24 +219,30 @@ def parse(raw: bytes) -> tuple[int, dict]:
             if tag == 3:  # end-of-attributes
                 break
             continue
-        name_length = struct.unpack(">H", body[position : position + 2])[0]
+        name_length = struct.unpack(">H", _take(body, position, 2))[0]
         position += 2
-        name = body[position : position + name_length].decode("utf8", "replace")
+        name = _take(body, position, name_length).decode("utf8", "replace")
         position += name_length
-        value_length = struct.unpack(">H", body[position : position + 2])[0]
+        value_length = struct.unpack(">H", _take(body, position, 2))[0]
         position += 2
-        value = body[position : position + value_length]
+        value = _take(body, position, value_length)
         position += value_length
         if name_length:
             current = name
+        elif current is None:
+            raise IppError("IPP answer starts a value with no attribute name")
         out.setdefault(current, []).append(_value(tag, value))
     return status, out
 
 
 def _value(tag: int, raw: bytes):
     if tag in (INTEGER, ENUM):
+        if len(raw) != 4:
+            raise IppError(f"IPP integer is {len(raw)} bytes long, not 4")
         return struct.unpack(">i", raw)[0]
     if tag == BOOLEAN:
+        if len(raw) != 1:
+            raise IppError(f"IPP boolean is {len(raw)} bytes long, not 1")
         return raw[0] == 1
     return raw.decode("utf8", "replace")
 
@@ -208,19 +317,30 @@ def printer_state(host: str, *, user: str) -> tuple[int, list[str]]:
     return answer.get("printer-state", [0])[0], answer.get("printer-state-reasons", [])
 
 
+def is_blocking_reason(reason: str) -> bool:
+    """Say whether a ``printer-state-reasons`` value means a job cannot finish."""
+    if reason in ("none", ""):
+        return False
+    return not reason.endswith(("-report", "-warning"))
+
+
 def wait_until_idle(host: str, *, user: str, timeout: float = 300.0,
                     interval: float = 5.0, sleep=time.sleep) -> tuple[int, list[str]]:
     """Block until the queue drains and the printer is idle.
 
     This is the confirmation step, because the job history is gone by then. Raises if
-    the printer reports any state reason other than ``none`` -- out of paper, a jam,
-    an open cover -- so a job that never reached paper is not reported as printed.
+    the printer reports a reason that needs attention -- out of paper, a jam, an open
+    cover -- so a job that never reached paper is not reported as printed. A reason
+    that ends in ``-report`` or ``-warning``, such as ``toner-low-warning``, does not
+    stop printing, so it does not block. Every other reason does, including one with no
+    suffix, because RFC 8011 says a ``printer-state-reasons`` value with no suffix is an
+    error.
     """
     deadline = time.monotonic() + timeout
     state, reasons = printer_state(host, user=user)
     while time.monotonic() < deadline:
         state, reasons = printer_state(host, user=user)
-        blocking = [r for r in reasons if r not in ("none", "")]
+        blocking = [r for r in reasons if is_blocking_reason(r)]
         if blocking:
             raise IppError(f"printer needs attention: {blocking}")
         if state == PRINTER_STATE_IDLE and not pending_jobs(host, user=user):
