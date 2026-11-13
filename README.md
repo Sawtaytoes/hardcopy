@@ -63,8 +63,10 @@ table is made of.
   pages sit on the stand together.
 * **A finished job disappears fast.** Job history can clear within seconds. `hardcopy
   print` therefore confirms by watching the queue drain and the printer return to idle,
-  and it fails loudly if the printer reports any state reason -- out of paper, a jam, an
-  open cover -- so a job that never reached paper is never reported as printed.
+  and it fails loudly if the printer reports a state reason that stops a job -- out of
+  paper, a jam, an open cover -- so a job that never reached paper is never reported as
+  printed. A reason that ends in `-report` or `-warning`, such as low toner, does not
+  stop a job, so it does not fail the print.
 
 ## Develop
 
