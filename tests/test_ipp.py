@@ -331,6 +331,26 @@ def test_request_has_a_deadline_for_the_whole_answer(monkeypatch):
     assert len(fake.replies) > 900
 
 
+def test_request_starts_the_reply_deadline_after_the_upload(monkeypatch):
+    """A slow upload must not use up the time the printer has to answer."""
+    now = [0.0]
+    monkeypatch.setattr(ipp.time, "monotonic", lambda: now[0])
+    raw = response(0x0000, JOB_ID)
+
+    class SlowUpload(FakeSocket):
+        def sendall(self, data):
+            now[0] += 179.0
+            super().sendall(data)
+
+        def recv(self, size):
+            now[0] += 1.0
+            return super().recv(size)
+
+    fake = SlowUpload([raw[:10], raw[10:20], raw[20:], b""])
+    monkeypatch.setattr(ipp.socket, "create_connection", lambda *a, **k: fake)
+    assert ipp.request("printer.invalid", ipp.OP_PRINT_JOB, timeout=180)[1] == {"job-id": [283]}
+
+
 def test_request_refuses_an_endless_answer(monkeypatch):
     fake = connect_to(monkeypatch, [b"HTTP/1.1 200 OK\r\n\r\n"] + [b"x" * 65536] * 300)
     with pytest.raises(ipp.IppError, match="larger than"):

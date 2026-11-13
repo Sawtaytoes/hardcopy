@@ -97,10 +97,11 @@ def request(host: str, operation: int, *, port: int = 631, resource: str = "/ipp
     except OSError as error:
         raise IppError(f"cannot reach the printer at {host}:{port}: {error}") from error
     try:
-        deadline = time.monotonic() + timeout
         sock.settimeout(timeout)
         sock.sendall(header + payload)
-        body = _receive(sock, deadline)
+        # The reply gets its own full timeout. Starting it before a slow upload would
+        # fail a job the printer already accepted, and a retry would print it twice.
+        body = _receive(sock, time.monotonic() + timeout)
     except TimeoutError as error:
         # A timeout is not the end of the answer. Parsing what arrived so far would read
         # a cut-off reply as a complete one.
